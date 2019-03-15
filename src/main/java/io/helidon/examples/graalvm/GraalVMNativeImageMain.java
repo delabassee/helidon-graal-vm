@@ -17,15 +17,13 @@ package io.helidon.examples.graalvm;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.Optional;
 import java.util.logging.LogManager;
-import java.util.logging.Logger;
 
 import javax.json.Json;
 import javax.json.JsonObject;
 
-import io.helidon.config.Config;
-import io.helidon.config.ConfigSources;
-import io.helidon.config.spi.ConfigSource;
 import io.helidon.health.HealthSupport;
 import io.helidon.health.checks.HealthChecks;
 import io.helidon.media.jsonb.server.JsonBindingSupport;
@@ -34,7 +32,9 @@ import io.helidon.metrics.MetricsSupport;
 import io.helidon.metrics.RegistryFactory;
 import io.helidon.security.Security;
 import io.helidon.security.integration.webserver.WebSecurity;
-import io.helidon.tracing.TracerBuilder;
+import io.helidon.security.providers.abac.AbacProvider;
+import io.helidon.security.providers.httpauth.HttpBasicAuthProvider;
+import io.helidon.security.providers.httpauth.UserStore;
 import io.helidon.webserver.Handler;
 import io.helidon.webserver.Routing;
 import io.helidon.webserver.ServerConfiguration;
@@ -60,12 +60,18 @@ import org.eclipse.microprofile.metrics.MetricRegistry;
 public final class GraalVMNativeImageMain {
     private static long timestamp;
 
+    private static final Routing routing;
+
     static {
         try {
             LogManager.getLogManager().readConfiguration(GraalVMNativeImageMain.class.getResourceAsStream("/logging.properties"));
         } catch (IOException e) {
             e.printStackTrace();
         }
+
+        // in this example, we move all possible initialization here, so we should start faster
+        // not using config, as it is useless when everything is initialized in advance
+        routing = routing();
     }
 
     // private constructor
@@ -84,26 +90,14 @@ public final class GraalVMNativeImageMain {
 
         timestamp = System.currentTimeMillis();
 
-        Config config = createConfig();
-
-        ServerConfiguration serverConfig = ServerConfiguration.builder(config.get("server"))
-                /*
-                 Tracing registration
-                 */
-                .tracer(TracerBuilder.create(config.get("tracing")).buildAndRegister())
+        ServerConfiguration serverConfig = ServerConfiguration.builder()
+                .port(8099)
                 .build();
 
-        WebServer.create(serverConfig, routing(config))
-                .start()
+        WebServer webServer = WebServer.create(serverConfig, routing);
+        webServer.start()
                 .thenAccept(GraalVMNativeImageMain::webServerStarted)
                 .exceptionally(GraalVMNativeImageMain::webServerFailed);
-    }
-
-    private static Config createConfig() {
-        return Config.create(
-                ConfigSources.file("conf/dev-application.yaml").optional(),
-                ConfigSources.classpath("application.yaml")
-        );
     }
 
     private static Void webServerFailed(Throwable throwable) {
@@ -121,25 +115,20 @@ public final class GraalVMNativeImageMain {
         System.out.println("http://localhost:" + webServer.port() + "/");
     }
 
-    private static Routing routing(Config config) {
-        /*
-         * Config
-         */
-        String message = config.get("my-app.message").asString().orElse("Default message");
-
+    private static Routing routing() {
+        String message = "Message from static initialization";
         /*
          * Metrics
          */
         // there is an ordering requirement for metric support in v 1.0.0 - to be fixed in later versions
-        MetricsSupport metrics = MetricsSupport.create(config.get("metrics"));
-        MetricRegistry registry = RegistryFactory.getRegistryFactory().get().getRegistry(MetricRegistry.Type.APPLICATION);
+        MetricsSupport metrics = MetricsSupport.create();
+        MetricRegistry registry = RegistryFactory.getInstance().getRegistry(MetricRegistry.Type.APPLICATION);
         Counter counter = registry.counter("counter");
 
         /*
          * Health
          */
         HealthSupport health = HealthSupport.builder()
-                .config(config.get("health"))
                 .add((HealthCheck) () -> HealthCheckResponse.builder()
                         .name("test")
                         .up()
@@ -151,9 +140,14 @@ public final class GraalVMNativeImageMain {
         /*
          * Security
          */
-        Config securityConfig = config.get("security");
-        Security security = Security.create(securityConfig);
-        WebSecurity webSecurity = WebSecurity.create(security, securityConfig);
+        Security security = Security.builder()
+                .addAuthenticationProvider(HttpBasicAuthProvider.builder()
+                                                   .userStore(userStore())
+                                                   .build())
+                .addAuthorizationProvider(AbacProvider.create())
+                .build();
+
+        WebSecurity webSecurity = WebSecurity.create(security);
 
         return Routing.builder()
                 // register /metrics endpoint that serves metric information
@@ -162,6 +156,8 @@ public final class GraalVMNativeImageMain {
                 .register(webSecurity)
                 // register /health endpoint that serves health cheks
                 .register(health)
+                .any("/hello", WebSecurity.authenticate().rolesAllowed("admin"))
+                .any("/json", WebSecurity.authenticate().rolesAllowed("user", "admin"))
                 .get("/", (req, res) -> res.send(message))
                 .get("/hello", (req, res) -> {
                     res.send("Hello World");
@@ -174,6 +170,38 @@ public final class GraalVMNativeImageMain {
                 .get("/jsonb", GraalVMNativeImageMain::jsonbResponse)
                 .put("/jsonb", Handler.create(JsonBHello.class, GraalVMNativeImageMain::jsonbRequest))
                 .build();
+    }
+
+    private static UserStore userStore() {
+        return username -> {
+            switch (username) {
+            case "jack":
+                return Optional.of(createUser("jack", "jackIsGreat", "admin"));
+            case "jill":
+                return Optional.of(createUser("jill", "jillToo", "user"));
+            default:
+                return Optional.empty();
+            }
+        };
+    }
+
+    private static UserStore.User createUser(String username, String password, String... roles) {
+        return new UserStore.User() {
+            @Override
+            public String login() {
+                return username;
+            }
+
+            @Override
+            public char[] password() {
+                return password.toCharArray();
+            }
+
+            @Override
+            public Collection<String> roles() {
+                return Arrays.asList(roles);
+            }
+        };
     }
 
     private static void jsonbRequest(ServerRequest request, ServerResponse serverResponse, JsonBHello hello) {
